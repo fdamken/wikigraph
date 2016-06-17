@@ -1,0 +1,50 @@
+{
+	"properties": 
+	[
+		{
+			"name": "graphdb.path",
+			"type": "org.springframework.core.io.Resource",
+			"description": "The directory to store the data of Neo4j in."
+		},
+		{
+			"name": "graphdb.config",
+			"type": "org.springframework.core.io.Resource",
+			"description": "The location of the Neo4j configuration. Settings in this file are overwriting the bootstrap configuration."
+		},
+		{
+			"name": "graphdb.bootstrap-config",
+			"type": "org.springframework.core.io.Resource",
+			"description": "The location of the bootstrap Neo4j configuration. Settings in this file are overwritten by the regular configuration."
+		},
+		{
+			"name": "graphdb.port",
+			"type": "int",
+			"description": "The port the Neo4j browser should run on."
+		},
+		{
+			"name": "wikidb.driver-class",
+			"type": "java.lang.String",
+			"description": "The class of the JDBC driver to use to connect to the wiki database."
+		},
+		{
+			"name": "wikidb.username",
+			"type": "java.lang.String",
+			"description": "The username to use to connect to the wiki database."
+		},
+		{
+			"name": "wikidb.password",
+			"type": "java.lang.String",
+			"description": "The password to use to connect to the wiki database."
+		},
+		{
+			"name": "wikidb.url",
+			"type": "java.lang.String",
+			"description": "The JDBC URL of the wiki database."
+		},
+		{
+			"name": "wikidb.prefix",
+			"type": "java.lang.String",
+			"description": "The prefix in front of the tables of the wiki database."
+		}
+	]
+}
