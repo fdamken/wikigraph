@@ -28,11 +28,15 @@ import java.nio.file.attribute.BasicFileAttributes;
 import java.sql.Connection;
 import java.sql.PreparedStatement;
 import java.sql.ResultSet;
+import java.sql.SQLException;
+import java.util.ArrayList;
+import java.util.Collection;
 import java.util.HashMap;
-import java.util.HashSet;
+import java.util.List;
 import java.util.Map;
-import java.util.Set;
-import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.concurrent.ExecutionException;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
 
 import javax.annotation.PostConstruct;
 import javax.sql.DataSource;
@@ -63,6 +67,15 @@ public class ArticleService {
      * 
      */
     private static final Logger LOGGER = LoggerFactory.getLogger(ArticleService.class);
+
+    /**
+     * The count of connections that can be used to query for article
+     * references.
+     * 
+     */
+    // Acquire 4 connections per CPU core. The most processing is done on the
+    // SQL server, so this is perfectly fine.
+    private static final int CONNECTION_COUNT = Runtime.getRuntime().availableProcessors() * 4;
 
     /**
      * The location where Neo4j runs.
@@ -96,7 +109,7 @@ public class ArticleService {
     private String queryReferences;
 
     /**
-     * Invokes after this bean was constructed.
+     * Invoked after this bean was constructed.
      *
      */
     @PostConstruct
@@ -109,7 +122,7 @@ public class ArticleService {
                 + "     " + this.tablePrefix + "page" //
                 + " WHERE" //
                 + "     page_namespace = 0" //
-                + "";
+                + " LIMIT 10000";
         this.queryReferences = "" //
                 + " SELECT" //
                 + "     pl_from AS from_id," //
@@ -120,7 +133,7 @@ public class ArticleService {
     }
 
     /**
-     * Clears the database by deleting the Neo4j directory and restarting the
+     * Clears the database by deleting the Neo4j directory and restarts the
      * server.
      *
      */
@@ -168,7 +181,8 @@ public class ArticleService {
     }
 
     /**
-     * Builds the articles and the references between them.
+     * Builds the articles and the references between them. Restarts the server
+     * after completion.
      * 
      * <p>
      * NOTE: This method make take a long, long time!
@@ -177,93 +191,106 @@ public class ArticleService {
      */
     @SneakyThrows
     public synchronized void build() {
+        // ~ LOGGING ~
         final StopWatch stopWatchTotal = new StopWatch();
         stopWatchTotal.start();
-
         final StopWatch stopWatch = new StopWatch();
-
         ArticleService.LOGGER.info("Building articles.");
+        // ~ LOGGING ~
 
-        try (final Connection connection = this.dataSource.getConnection()) {
-            GraphDatabaseLifecycleManager.shutdown();
+        GraphDatabaseLifecycleManager.shutdown();
 
-            ArticleService.LOGGER.info("Step 1/3: Reading data.");
-            stopWatch.start("step1");
+        // ~ LOGGING ~
+        ArticleService.LOGGER.info("Step 1/3: Reading data.");
+        stopWatch.start("step1");
+        // ~ LOGGING ~
 
-            final Set<Long> graphIds = new HashSet<>();
-            final Map<String, Long> titleToGraphId = new HashMap<>();
+        final Map<String, Integer> nodes = this.retrieveArticles();
+        final List<Integer> nodesValues = new ArrayList<>(nodes.values());
 
-            // Step 1/3
-            try (final PreparedStatement statement = connection.prepareStatement(this.queryArticles);
-                    final ResultSet result = statement.executeQuery()) {
-                while (result.next()) {
-                    final long id = result.getLong("page_id");
-                    final String title = result.getString("page_title");
+        // ~ LOGGING ~
+        stopWatch.stop();
+        ArticleService.LOGGER.info("Step 1 took " + stopWatch.getLastTaskTimeMillis() + "ms.");
+        ArticleService.LOGGER.info("Step 2/3: Writing nodes.");
+        stopWatch.start("step2");
+        // ~ LOGGING ~
 
-                    graphIds.add(id);
-                    titleToGraphId.put(title, id);
-                }
-            }
+        final BatchInserter inserter = BatchInserters.inserter(this.graphdbPath.getFile().getAbsolutePath());
 
-            stopWatch.stop();
-            ArticleService.LOGGER.info("Step 1 took " + stopWatch.getLastTaskTimeMillis() + "ms.");
+        // Step 2/3
+        nodes.entrySet().forEach(entry -> {
+            final String title = entry.getKey();
+            final int id = entry.getValue();
 
-            ArticleService.LOGGER.info("Step 2/3: Writing nodes.");
-            stopWatch.start("step2");
+            final Map<String, Object> properties = new HashMap<>();
+            properties.put("pageId", id);
+            properties.put("title", title);
 
-            final BatchInserter inserter = BatchInserters.inserter(this.graphdbPath.getFile().getAbsolutePath());
+            inserter.createNode(id, properties);
+        });
 
-            // Step 2/3
-            titleToGraphId.entrySet().forEach(entry -> {
-                final String title = entry.getKey();
-                final long id = entry.getValue();
+        // ~ LOGGING ~
+        stopWatch.stop();
+        ArticleService.LOGGER.info("Step 2 took " + stopWatch.getLastTaskTimeMillis() + "ms.");
+        ArticleService.LOGGER.info("Step 3/3: Creating node relationships.");
+        stopWatch.start("step3");
+        // ~ LOGGING ~
 
-                final Map<String, Object> properties = new HashMap<>();
-                properties.put("pageId", id);
-                properties.put("title", title);
-
-                inserter.createNode(id, properties);
-            });
-
-            stopWatch.stop();
-            ArticleService.LOGGER.info("Step 2 took " + stopWatch.getLastTaskTimeMillis() + "ms.");
-
-            ArticleService.LOGGER.info("Step 3/3: Creating node relationships.");
-            stopWatch.start("step3");
-
-            // Step 3/3
-            final StringBuilder queryBuilder = new StringBuilder(this.queryReferences);
-            final AtomicBoolean first = new AtomicBoolean(true);
-            graphIds.forEach(id -> {
-                if (first.getAndSet(false)) {
-                    queryBuilder.append(" WHERE");
-                } else {
-                    queryBuilder.append(" OR");
-                }
-                queryBuilder.append(" pl_from = '").append(id).append("'");
-            });
-            final String query = queryBuilder.toString();
-            try (final PreparedStatement statement = connection.prepareStatement(query);
-                    final ResultSet result = statement.executeQuery()) {
-                while (result.next()) {
-                    final long fromId = result.getLong("from_id");
-                    final String toTitle = result.getString("to_title");
-
-                    final Long refGraphId = titleToGraphId.get(toTitle);
-                    if (refGraphId != null) {
-                        inserter.createRelationship(fromId, refGraphId, RelationshipTypes.REFERENCES, null);
-                    }
-                }
-            }
-
-            stopWatch.stop();
-            ArticleService.LOGGER.info("Step 3 took " + stopWatch.getLastTaskTimeMillis() + "ms.");
-
-            inserter.shutdown();
+        // Step 3/3
+        final int nodeCount = nodes.size();
+        final int partCount = Math.min(ArticleService.CONNECTION_COUNT, nodeCount);
+        final int partSize = nodeCount / (partCount - 1);
+        final List<List<Integer>> parts = new ArrayList<>(partCount);
+        for (int i = 0; i < partCount; i++) {
+            parts.add(nodesValues.subList(i * partSize, Math.min(i * partSize + partSize, nodeCount)));
         }
 
+        final ExecutorService executer = Executors.newFixedThreadPool(partCount);
+        parts.parallelStream().map(part -> {
+            return executer.submit(() -> {
+                final Map<Integer, Integer> map = new HashMap<>();
+                final String query = this.buildReferenceQuery(part);
+
+                System.out.println("Executing query: <" + query + ">");
+
+                try (Connection connection = this.acquireConnection();
+                        final PreparedStatement statement = connection.prepareStatement(query);
+                        final ResultSet result = statement.executeQuery()) {
+                    while (result.next()) {
+                        final int fromId = result.getInt("from_id");
+                        final String toTitle = result.getString("to_title");
+
+                        final Integer refGraphId = nodes.get(toTitle);
+                        if (refGraphId != null) {
+                            map.put(fromId, refGraphId);
+                        }
+                    }
+                }
+                return map;
+            });
+        }).map(future -> {
+            try {
+                return future.get();
+            } catch (final ExecutionException | InterruptedException cause) {
+                throw new RuntimeException(cause);
+            }
+        }).sequential().forEach(map -> {
+            map.entrySet().forEach(entry -> {
+                inserter.createRelationship(entry.getKey(), entry.getValue(), RelationshipTypes.REFERENCES, null);
+            });
+        });
+
+        // ~ LOGGING ~
+        stopWatch.stop();
+        ArticleService.LOGGER.info("Step 3 took " + stopWatch.getLastTaskTimeMillis() + "ms.");
+        // ~ LOGGING ~
+
+        inserter.shutdown();
+
+        // ~ LOGGING ~
         stopWatchTotal.stop();
         ArticleService.LOGGER.info("Finished building in " + stopWatchTotal.getTotalTimeMillis() + "ms. Restarting application.");
+        // ~ LOGGING ~
 
         WikiGraph.restart();
     }
@@ -291,6 +318,78 @@ public class ArticleService {
 
             ArticleService.LOGGER.info("Rebuild finished!");
         }).start();
+    }
+
+    /**
+     * Creates a connection to the wiki database.
+     *
+     * <p>
+     * This also logs the time it takes to connect to the database.
+     * </p>
+     *
+     * @return The connection.
+     * @throws SQLException
+     *             If any SQL error occurs.
+     */
+    private Connection acquireConnection() throws SQLException {
+        final StopWatch stopWatch = new StopWatch();
+        ArticleService.LOGGER.info("Connecting to the wiki database...");
+        stopWatch.start();
+
+        final Connection connection = this.dataSource.getConnection();
+
+        stopWatch.stop();
+        ArticleService.LOGGER.info("Connection established! Took: " + stopWatch.getTotalTimeMillis() + "ms");
+
+        return connection;
+    }
+
+    /**
+     * Retrieves all articles by using the {@link #queryArticles article query}.
+     *
+     * @return All retrieved articles with a title-to-ID mapping.
+     * @throws SQLException
+     *             If any SQL error occurs.
+     */
+    private Map<String, Integer> retrieveArticles() throws SQLException {
+        final Map<String, Integer> articles = new HashMap<>();
+        try (final Connection connection = this.acquireConnection();
+                final PreparedStatement statement = connection.prepareStatement(this.queryArticles);
+                final ResultSet result = statement.executeQuery()) {
+            while (result.next()) {
+                final int id = result.getInt("page_id");
+                final String title = result.getString("page_title");
+
+                articles.put(title, id);
+            }
+            return articles;
+        }
+    }
+
+    /**
+     * Builds the query that queries for all references from the articles
+     * identified by the given page IDs.
+     *
+     * @param ids
+     *            The page IDs to find the referenced articles for.
+     * @return The query.
+     */
+    private String buildReferenceQuery(final Collection<Integer> ids) {
+        final StringBuilder builder = new StringBuilder(this.queryReferences);
+        builder.append(" WHERE pl_from IN (");
+        boolean first = true;
+        for (final Integer id : ids) {
+            if (id != null) {
+                if (first) {
+                    first = false;
+                } else {
+                    builder.append(',');
+                }
+                builder.append('\'').append(id).append('\'');
+            }
+        }
+        builder.append(')');
+        return builder.toString();
     }
 
     /**
