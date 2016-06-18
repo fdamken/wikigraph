@@ -34,9 +34,10 @@ import java.util.Collection;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.concurrent.Callable;
 import java.util.concurrent.ExecutionException;
-import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
+import java.util.stream.Collectors;
 
 import javax.annotation.PostConstruct;
 import javax.sql.DataSource;
@@ -67,15 +68,6 @@ public class ArticleService {
      * 
      */
     private static final Logger LOGGER = LoggerFactory.getLogger(ArticleService.class);
-
-    /**
-     * The count of connections that can be used to query for article
-     * references.
-     * 
-     */
-    // Acquire 4 connections per CPU core. The most processing is done on the
-    // SQL server, so this is perfectly fine.
-    private static final int CONNECTION_COUNT = Runtime.getRuntime().availableProcessors() * 4;
 
     /**
      * The location where Neo4j runs.
@@ -122,7 +114,7 @@ public class ArticleService {
                 + "     " + this.tablePrefix + "page" //
                 + " WHERE" //
                 + "     page_namespace = 0" //
-                + " LIMIT 10000";
+                + "";
         this.queryReferences = "" //
                 + " SELECT" //
                 + "     pl_from AS from_id," //
@@ -238,21 +230,31 @@ public class ArticleService {
 
         // Step 3/3
         final int nodeCount = nodes.size();
-        final int partCount = Math.min(ArticleService.CONNECTION_COUNT, nodeCount);
+        // Calculates the "best matching thread count" suited for the number of
+        // nodes. This prevents an overhead of threads and connection if the
+        // node count is too low and increases the thread count the more threads
+        // there are. Using the available processors the load is balanced on
+        // them by using a multiplier that is calculated as described before.
+        // The multiplier is limited to 16 so that at most 16 threads are
+        // running per core. Although this would not be practical for real
+        // processor usage, it is as the calculation is done by the database and
+        // each connection's resources are limited.
+        final int bestMatchingThreadCount = Math.max(Math.min((int) Math.log10(nodeCount * 1_000), 16), 1)
+                * Runtime.getRuntime().availableProcessors();
+        final int partCount = Math.min(bestMatchingThreadCount, nodeCount);
         final int partSize = nodeCount / (partCount - 1);
         final List<List<Integer>> parts = new ArrayList<>(partCount);
         for (int i = 0; i < partCount; i++) {
             parts.add(nodesValues.subList(i * partSize, Math.min(i * partSize + partSize, nodeCount)));
         }
+        Executors.newCachedThreadPool().invokeAll(parts.stream().<Callable<Map<Integer, Integer>>>map(part -> {
+            return () -> {
+                // ~ LOGGING ~
+                ArticleService.LOGGER.debug("Fetching relationship data...");
+                // ~ LOGGING ~
 
-        final ExecutorService executer = Executors.newFixedThreadPool(partCount);
-        parts.parallelStream().map(part -> {
-            return executer.submit(() -> {
                 final Map<Integer, Integer> map = new HashMap<>();
                 final String query = this.buildReferenceQuery(part);
-
-                System.out.println("Executing query: <" + query + ">");
-
                 try (Connection connection = this.acquireConnection();
                         final PreparedStatement statement = connection.prepareStatement(query);
                         final ResultSet result = statement.executeQuery()) {
@@ -266,18 +268,31 @@ public class ArticleService {
                         }
                     }
                 }
+
+                // ~ LOGGING ~
+                ArticleService.LOGGER.debug("Relationship data fetched.");
+                // ~ LOGGING ~
+
                 return map;
-            });
-        }).map(future -> {
+            };
+        }).collect(Collectors.toList())).stream().map(future -> {
             try {
                 return future.get();
             } catch (final ExecutionException | InterruptedException cause) {
                 throw new RuntimeException(cause);
             }
-        }).sequential().forEach(map -> {
+        }).forEach(map -> {
+            // ~ LOGGING ~
+            ArticleService.LOGGER.debug("Creating node relationships...");
+            // ~ LOGGING ~
+
             map.entrySet().forEach(entry -> {
                 inserter.createRelationship(entry.getKey(), entry.getValue(), RelationshipTypes.REFERENCES, null);
             });
+
+            // ~ LOGGING ~
+            ArticleService.LOGGER.debug("Node relationships created.");
+            // ~ LOGGING ~
         });
 
         // ~ LOGGING ~
@@ -312,11 +327,15 @@ public class ArticleService {
      */
     public void scheduleRebuild() {
         new Thread(() -> {
+            // ~ LOGGING ~
             ArticleService.LOGGER.info("Rebuild triggered!");
+            // ~ LOGGING ~
 
             this.rebuild();
 
+            // ~ LOGGING ~
             ArticleService.LOGGER.info("Rebuild finished!");
+            // ~ LOGGING ~
         }).start();
     }
 
@@ -333,13 +352,13 @@ public class ArticleService {
      */
     private Connection acquireConnection() throws SQLException {
         final StopWatch stopWatch = new StopWatch();
-        ArticleService.LOGGER.info("Connecting to the wiki database...");
+        ArticleService.LOGGER.trace("Connecting to the wiki database...");
         stopWatch.start();
 
         final Connection connection = this.dataSource.getConnection();
 
         stopWatch.stop();
-        ArticleService.LOGGER.info("Connection established! Took: " + stopWatch.getTotalTimeMillis() + "ms");
+        ArticleService.LOGGER.trace("Connection established! Took: " + stopWatch.getTotalTimeMillis() + "ms");
 
         return connection;
     }
