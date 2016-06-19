@@ -19,11 +19,17 @@
  */
 package de.fdamken.mwt.wikigraph.service;
 
+import java.io.BufferedInputStream;
+import java.io.BufferedOutputStream;
+import java.io.File;
 import java.io.IOException;
+import java.io.InputStream;
+import java.io.OutputStream;
 import java.nio.file.FileVisitResult;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.nio.file.SimpleFileVisitor;
+import java.nio.file.StandardOpenOption;
 import java.nio.file.attribute.BasicFileAttributes;
 import java.sql.Connection;
 import java.sql.PreparedStatement;
@@ -37,9 +43,14 @@ import java.util.Map;
 import java.util.concurrent.Callable;
 import java.util.concurrent.ExecutionException;
 import java.util.concurrent.Executors;
+import java.util.concurrent.Future;
+import java.util.concurrent.atomic.AtomicInteger;
+import java.util.concurrent.atomic.AtomicReference;
 import java.util.stream.Collectors;
+import java.util.stream.Stream;
 
 import javax.annotation.PostConstruct;
+import javax.annotation.PreDestroy;
 import javax.sql.DataSource;
 
 import org.neo4j.graphdb.RelationshipType;
@@ -101,15 +112,45 @@ public class ArticleService {
     private String queryReferences;
 
     /**
+     * The file where the articles are stored in a binary format.
+     * 
+     * <p>
+     * The file format:
+     * <table border="1px solid black">
+     * <tr>
+     * <th>Field Name</th>
+     * <th>Field Size (in Byte)</th>
+     * </tr>
+     * <tr>
+     * <td>Page ID</td>
+     * <td>4</td>
+     * </tr>
+     * <tr>
+     * <td>Title Length</td>
+     * <td>4</td>
+     * </tr>
+     * <tr>
+     * <td>Title</td>
+     * <td>Specified by field "Title Length"</td>
+     * </tr>
+     * </table>
+     * </p>
+     * 
+     */
+    private Path articleFile;
+
+    /**
      * Invoked after this bean was constructed.
-     *
+     * 
+     * @throws IOException
+     *             If any I/O error occurs.
      */
     @PostConstruct
-    public void onPostConstruct() {
+    public void onPostConstruct() throws IOException {
         this.queryArticles = "" //
                 + " SELECT" //
-                + "     page_id," //
-                + "     page_title" //
+                + "     page_id AS id," //
+                + "     page_title AS title" //
                 + " FROM" //
                 + "     " + this.tablePrefix + "page" //
                 + " WHERE" //
@@ -117,11 +158,29 @@ public class ArticleService {
                 + "";
         this.queryReferences = "" //
                 + " SELECT" //
-                + "     pl_from AS from_id," //
-                + "     pl_title AS to_title" //
+                + "     L.pl_from AS from_id," //
+                + "     P.page_id AS to_id" //
                 + " FROM" //
-                + "     " + this.tablePrefix + "pagelinks" //
+                + "     " + this.tablePrefix + "pagelinks AS L" //
+                + " INNER JOIN " + this.tablePrefix + "page as P ON L.pl_title = P.page_title" //
+                + " WHERE" //
+                + "     P.page_namespace = 0" //
                 + "";
+
+        this.articleFile = File.createTempFile("wikigraph", "articles").toPath();
+
+        ArticleService.LOGGER.debug("Using article file at " + this.articleFile);
+    }
+
+    /**
+     * Invoked right before this bean gets destroyed.
+     *
+     * @throws IOException
+     *             If any I/O error occurs.
+     */
+    @PreDestroy
+    public void onPreDestroy() throws IOException {
+        Files.deleteIfExists(this.articleFile);
     }
 
     /**
@@ -129,13 +188,17 @@ public class ArticleService {
      * server.
      *
      */
-    @SneakyThrows
-    public void clear() {
+    @SneakyThrows(IOException.class)
+    public synchronized void clear() {
+        // ~ LOGGING ~
         ArticleService.LOGGER.info("Clearing database.");
+        // ~ LOGGING ~
 
         GraphDatabaseLifecycleManager.shutdown();
 
-        ArticleService.LOGGER.info("Deleting data.");
+        // ~ LOGGING ~
+        ArticleService.LOGGER.info("Deleting data...");
+        // ~ LOGGING ~
 
         Files.walkFileTree(this.graphdbPath.getFile().toPath(), new SimpleFileVisitor<Path>() {
             /**
@@ -165,11 +228,15 @@ public class ArticleService {
             }
         });
 
+        // ~ LOGGING ~
         ArticleService.LOGGER.info("Data deleted. Restarting WikiGraph.");
+        // ~ LOGGING ~
 
         WikiGraph.restart();
 
+        // ~ LOGGING ~
         ArticleService.LOGGER.info("Database cleared.");
+        // ~ LOGGING ~
     }
 
     /**
@@ -181,45 +248,43 @@ public class ArticleService {
      * </p>
      *
      */
-    @SneakyThrows
+    @SneakyThrows({ SQLException.class, InterruptedException.class, IOException.class })
     public synchronized void build() {
         // ~ LOGGING ~
         final StopWatch stopWatchTotal = new StopWatch();
         stopWatchTotal.start();
         final StopWatch stopWatch = new StopWatch();
         ArticleService.LOGGER.info("Building articles.");
+        ArticleService.LOGGER.debug("Shutting down graph database...");
         // ~ LOGGING ~
 
         GraphDatabaseLifecycleManager.shutdown();
 
         // ~ LOGGING ~
-        ArticleService.LOGGER.info("Step 1/3: Reading data.");
+        ArticleService.LOGGER.debug("Graph database shut down.");
+        ArticleService.LOGGER.info("Step 1/3: Retrieving articles.");
         stopWatch.start("step1");
         // ~ LOGGING ~
 
-        final Map<String, Integer> nodes = this.retrieveArticles();
-        final List<Integer> nodesValues = new ArrayList<>(nodes.values());
+        // Step 1
+        this.retrieveArticles();
 
         // ~ LOGGING ~
         stopWatch.stop();
         ArticleService.LOGGER.info("Step 1 took " + stopWatch.getLastTaskTimeMillis() + "ms.");
         ArticleService.LOGGER.info("Step 2/3: Writing nodes.");
+        ArticleService.LOGGER.debug("Starting batch inserter...");
         stopWatch.start("step2");
         // ~ LOGGING ~
 
         final BatchInserter inserter = BatchInserters.inserter(this.graphdbPath.getFile().getAbsolutePath());
 
-        // Step 2/3
-        nodes.entrySet().forEach(entry -> {
-            final String title = entry.getKey();
-            final int id = entry.getValue();
+        // ~ LOGGING ~
+        ArticleService.LOGGER.debug("Batch inserter started.");
+        // ~ LOGGING ~
 
-            final Map<String, Object> properties = new HashMap<>();
-            properties.put("pageId", id);
-            properties.put("title", title);
-
-            inserter.createNode(id, properties);
-        });
+        // Step 2
+        this.writeNodes(inserter);
 
         // ~ LOGGING ~
         stopWatch.stop();
@@ -228,83 +293,21 @@ public class ArticleService {
         stopWatch.start("step3");
         // ~ LOGGING ~
 
-        // Step 3/3
-        final int nodeCount = nodes.size();
-        // Calculates the "best matching thread count" suited for the number of
-        // nodes. This prevents an overhead of threads and connection if the
-        // node count is too low and increases the thread count the more threads
-        // there are. Using the available processors the load is balanced on
-        // them by using a multiplier that is calculated as described before.
-        // The multiplier is limited to 16 so that at most 16 threads are
-        // running per core. Although this would not be practical for real
-        // processor usage, it is as the calculation is done by the database and
-        // each connection's resources are limited.
-        final int bestMatchingThreadCount = Math.max(Math.min((int) Math.log10(nodeCount * 1_000), 16), 1)
-                * Runtime.getRuntime().availableProcessors();
-        final int partCount = Math.min(bestMatchingThreadCount, nodeCount);
-        final int partSize = nodeCount / (partCount - 1);
-        final List<List<Integer>> parts = new ArrayList<>(partCount);
-        for (int i = 0; i < partCount; i++) {
-            parts.add(nodesValues.subList(i * partSize, Math.min(i * partSize + partSize, nodeCount)));
-        }
-        Executors.newCachedThreadPool().invokeAll(parts.stream().<Callable<Map<Integer, Integer>>>map(part -> {
-            return () -> {
-                // ~ LOGGING ~
-                ArticleService.LOGGER.debug("Fetching relationship data...");
-                // ~ LOGGING ~
-
-                final Map<Integer, Integer> map = new HashMap<>();
-                final String query = this.buildReferenceQuery(part);
-                try (Connection connection = this.acquireConnection();
-                        final PreparedStatement statement = connection.prepareStatement(query);
-                        final ResultSet result = statement.executeQuery()) {
-                    while (result.next()) {
-                        final int fromId = result.getInt("from_id");
-                        final String toTitle = result.getString("to_title");
-
-                        final Integer refGraphId = nodes.get(toTitle);
-                        if (refGraphId != null) {
-                            map.put(fromId, refGraphId);
-                        }
-                    }
-                }
-
-                // ~ LOGGING ~
-                ArticleService.LOGGER.debug("Relationship data fetched.");
-                // ~ LOGGING ~
-
-                return map;
-            };
-        }).collect(Collectors.toList())).stream().map(future -> {
-            try {
-                return future.get();
-            } catch (final ExecutionException | InterruptedException cause) {
-                throw new RuntimeException(cause);
-            }
-        }).forEach(map -> {
-            // ~ LOGGING ~
-            ArticleService.LOGGER.debug("Creating node relationships...");
-            // ~ LOGGING ~
-
-            map.entrySet().forEach(entry -> {
-                inserter.createRelationship(entry.getKey(), entry.getValue(), RelationshipTypes.REFERENCES, null);
-            });
-
-            // ~ LOGGING ~
-            ArticleService.LOGGER.debug("Node relationships created.");
-            // ~ LOGGING ~
-        });
+        // Step 3
+        this.createNodeRelationships(inserter);
 
         // ~ LOGGING ~
         stopWatch.stop();
         ArticleService.LOGGER.info("Step 3 took " + stopWatch.getLastTaskTimeMillis() + "ms.");
+        ArticleService.LOGGER.debug("Shutting down batch inserter...");
         // ~ LOGGING ~
 
         inserter.shutdown();
 
         // ~ LOGGING ~
         stopWatchTotal.stop();
-        ArticleService.LOGGER.info("Finished building in " + stopWatchTotal.getTotalTimeMillis() + "ms. Restarting application.");
+        ArticleService.LOGGER.debug("Batch inserter shut down.");
+        ArticleService.LOGGER.info("Finished building in " + stopWatchTotal.getTotalTimeMillis() + "ms. Restarting WikiGraph.");
         // ~ LOGGING ~
 
         WikiGraph.restart();
@@ -364,25 +367,180 @@ public class ArticleService {
     }
 
     /**
-     * Retrieves all articles by using the {@link #queryArticles article query}.
+     * Retrieves all articles by and writes them into the article file.
      *
-     * @return All retrieved articles with a title-to-ID mapping.
      * @throws SQLException
      *             If any SQL error occurs.
+     * @throws IOException
+     *             If any I/O error occurs.
      */
-    private Map<String, Integer> retrieveArticles() throws SQLException {
-        final Map<String, Integer> articles = new HashMap<>();
-        try (final Connection connection = this.acquireConnection();
+    private void retrieveArticles() throws SQLException, IOException {
+        // ~ LOGGING ~
+        int count = 0;
+        // ~ LOGGING ~
+
+        try (final OutputStream out = new BufferedOutputStream(Files.newOutputStream(this.articleFile, StandardOpenOption.WRITE,
+                StandardOpenOption.TRUNCATE_EXISTING, StandardOpenOption.CREATE));
+                final Connection connection = this.acquireConnection();
                 final PreparedStatement statement = connection.prepareStatement(this.queryArticles);
                 final ResultSet result = statement.executeQuery()) {
             while (result.next()) {
-                final int id = result.getInt("page_id");
-                final String title = result.getString("page_title");
+                final int id = result.getInt("id");
+                final String title = result.getString("title");
 
-                articles.put(title, id);
+                this.writeInt(out, id);
+                this.writeString(out, title);
+
+                // ~ LOGGING ~
+                count++;
+                // ~ LOGGING ~
             }
-            return articles;
         }
+
+        // ~ LOGGING ~
+        ArticleService.LOGGER.trace(count + " articles fetched.");
+        // ~ LOGGING ~
+    }
+
+    /**
+     * Writes the nodes specified in the article file into the graph database.
+     *
+     * @param inserter
+     *            The {@link BatchInserter} that is used to write the nodes.
+     * @throws IOException
+     *             If any I/O error occurs.
+     */
+    private void writeNodes(final BatchInserter inserter) throws IOException {
+        // ~ LOGGING ~
+        int count = 0;
+        // ~ LOGGING ~
+
+        try (final InputStream in = new BufferedInputStream(
+                Files.newInputStream(this.articleFile, StandardOpenOption.READ, StandardOpenOption.CREATE))) {
+            while (in.available() > 0) {
+                final int id = this.readInt(in);
+                final String title = this.readString(in);
+
+                final Map<String, Object> properties = new HashMap<>();
+                properties.put("pageId", id);
+                properties.put("title", title);
+                inserter.createNode(id, properties);
+
+                // ~ LOGGING ~
+                count++;
+                // ~ LOGGING ~
+            }
+        }
+
+        // ~ LOGGING ~
+        ArticleService.LOGGER.debug(count + " nodes created.");
+        // ~ LOGGING ~
+    }
+
+    /**
+     * Creates the relationships between the nodes in the graph database.
+     *
+     * @param inserter
+     *            The inserter that is used to create the relationships.
+     * @throws IOException
+     *             If any I/O error occurs.
+     * @throws SQLException
+     *             If any SQL error occurs.
+     * @throws InterruptedException
+     *             If this thread was interrupted whilst waiting for an SQL
+     *             query to complete.
+     */
+    private void createNodeRelationships(final BatchInserter inserter) throws IOException, SQLException, InterruptedException {
+        final AtomicReference<List<Integer>> nodes = new AtomicReference<>(new ArrayList<>());
+        try (final InputStream in = new BufferedInputStream(
+                Files.newInputStream(this.articleFile, StandardOpenOption.READ, StandardOpenOption.CREATE))) {
+            while (in.available() > 0) {
+                nodes.get().add(this.readInt(in));
+                this.readString(in);
+            }
+        }
+
+        final int nodeCount = nodes.get().size();
+        // Calculates the "best matching thread count" suited for the number
+        // of nodes. This prevents an overhead of threads and connection if
+        // the node count is too low and increases the thread count the more
+        // threads there are. Using the available processors the load is
+        // balanced on them by using a multiplier that is calculated as
+        // described before. The multiplier is limited to 16 so that at most
+        // 16 threads are running per core. Although this would not be
+        // practical for real processor usage, it is as the calculation is
+        // done by the database and each connection's resources are limited.
+        final int bestMatchingThreadCount = Math.max(Math.min((int) Math.log10(nodeCount * 1_000_000), 16), 1)
+                * Runtime.getRuntime().availableProcessors();
+        final int partCount = Math.min(bestMatchingThreadCount, nodeCount);
+        final int partSize = nodeCount / (partCount - 1);
+        List<List<Integer>> parts = new ArrayList<>(partCount);
+        for (int i = 0; i < partCount; i++) {
+            parts.add(nodes.get().subList(i * partSize, Math.min(i * partSize + partSize, nodeCount)));
+        }
+
+        final List<Future<Map<Integer, Integer>>> futureStarter = Executors.newCachedThreadPool()
+                .invokeAll(parts.stream().<Callable<Map<Integer, Integer>>>map(part -> {
+                    return () -> {
+                        // ~ LOGGING ~
+                        ArticleService.LOGGER.debug("Fetching relationship data...");
+                        // ~ LOGGING ~
+
+                        final Map<Integer, Integer> map = new HashMap<>();
+                        final String query = this.buildReferenceQuery(part);
+                        try (Connection connection = this.acquireConnection();
+                                final PreparedStatement statement = connection.prepareStatement(query);
+                                final ResultSet result = statement.executeQuery()) {
+                            while (result.next()) {
+                                final int fromId = result.getInt("from_id");
+                                final int toId = result.getInt("to_id");
+
+                                if (nodes.get().contains(toId)) {
+                                    map.put(fromId, toId);
+                                }
+                            }
+                        }
+
+                        // ~ LOGGING ~
+                        ArticleService.LOGGER.debug("Relationship data fetched.");
+                        // ~ LOGGING ~
+
+                        return map;
+                    };
+                }).collect(Collectors.toList()));
+
+        // Help the GC a bit.
+        nodes.set(null);
+        parts = null;
+
+        final Stream<Map<Integer, Integer>> referenceMapStream = futureStarter.stream().map(future -> {
+            try {
+                return future.get();
+            } catch (final ExecutionException | InterruptedException cause) {
+                throw new RuntimeException(cause);
+            }
+        });
+
+        // ~ LOGGING ~
+        ArticleService.LOGGER.debug("Creating node relationships...");
+        final AtomicInteger count = new AtomicInteger(0);
+        // ~ LOGGING ~
+
+        referenceMapStream.forEach(map -> {
+            map.entrySet().forEach(entry -> {
+                inserter.createRelationship(entry.getKey(), entry.getValue(), RelationshipTypes.REFERENCES, null);
+
+                // ~ LOGGING ~
+                count.incrementAndGet();
+                // ~ LOGGING ~
+            });
+
+        });
+
+        // ~ LOGGING ~
+        ArticleService.LOGGER.trace(count.get() + " node relationships created.");
+        ArticleService.LOGGER.debug("Node relationships created.");
+        // ~ LOGGING ~
     }
 
     /**
@@ -395,7 +553,7 @@ public class ArticleService {
      */
     private String buildReferenceQuery(final Collection<Integer> ids) {
         final StringBuilder builder = new StringBuilder(this.queryReferences);
-        builder.append(" WHERE pl_from IN (");
+        builder.append(" AND pl_from IN (");
         boolean first = true;
         for (final Integer id : ids) {
             if (id != null) {
@@ -409,6 +567,92 @@ public class ArticleService {
         }
         builder.append(')');
         return builder.toString();
+    }
+
+    /**
+     * Writes the given integer into the given output stream using 4 byte in a
+     * big-endian format.
+     *
+     * <p>
+     * This does not flush or close the output stream!
+     * </p>
+     *
+     * @param out
+     *            The stream to write the data into.
+     * @param num
+     *            The number to write.
+     * @throws IOException
+     *             If any I/O error occurs.
+     */
+    private void writeInt(final OutputStream out, final int num) throws IOException {
+        final long unsigned = Integer.toUnsignedLong(num);
+        final byte[] bytes = new byte[4];
+        bytes[0] = (byte) (unsigned >> 8 * 3 & 0xFF);
+        bytes[1] = (byte) (unsigned >> 8 * 2 & 0xFF);
+        bytes[2] = (byte) (unsigned >> 8 * 1 & 0xFF);
+        bytes[3] = (byte) (unsigned >> 8 * 0 & 0xFF);
+        out.write(bytes);
+    }
+
+    /**
+     * Writes the given string into the given output stream by writing the
+     * length using {@link #writeInt(OutputStream, int)} and then appending the
+     * raw string bytes (UTF-8).
+     *
+     * <p>
+     * This does not flush or close the output stream!
+     * </p>
+     *
+     * @param out
+     *            The stream to write the data into.
+     * @param str
+     *            The string to write.
+     * @throws IOException
+     *             If any I/O error occurs.
+     */
+    private void writeString(final OutputStream out, final String str) throws IOException {
+        final byte[] bytes = str.getBytes("UTF-8");
+        this.writeInt(out, bytes.length);
+        out.write(bytes);
+    }
+
+    /**
+     * Reads a 4 byte big integer from the given input stream using a big-endian
+     * format.
+     *
+     * @param in
+     *            The stream to read the data from.
+     * @return The read integer.
+     * @throws IOException
+     *             If any I/O error occurs.
+     */
+    private int readInt(final InputStream in) throws IOException {
+        final byte[] bytes = new byte[4];
+        in.read(bytes);
+        int num = 0;
+        num |= (bytes[0] & 0xFF) << 8 * 3;
+        num |= (bytes[1] & 0xFF) << 8 * 2;
+        num |= (bytes[2] & 0xFF) << 8 * 1;
+        num |= (bytes[3] & 0xFF) << 8 * 0;
+        return num;
+    }
+
+    /**
+     * Reads a string from the given input stream by interpreting the first 4
+     * byte (big-endian) as the length of the string. The following bytes are
+     * interpreted as the raw string (UTF-8).
+     *
+     * @param in
+     *            The stream to read the data from.
+     * @return The read string.
+     * @throws IOException
+     *             If any I/O error occurs.
+     */
+    private String readString(final InputStream in) throws IOException {
+        final int length = this.readInt(in);
+        final byte[] bytes = new byte[length];
+        in.read(bytes);
+        return new String(bytes, "UTF-8");
     }
 
     /**

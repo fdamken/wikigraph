@@ -59,7 +59,7 @@ public class ArticleRestController {
      * 
      * @return The map to be converted into a JSON object.
      */
-    @RequestMapping
+    @RequestMapping(produces = "application/json; charset=utf-8")
     public Map<String, Object> handleFindAll() {
         final Map<String, Object> map = new HashMap<>();
         try (Transaction tx = this.graphDatabase.beginTx()) {

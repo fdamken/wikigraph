@@ -44,9 +44,10 @@
 	<script>
 		window.alchemy = new Alchemy({
 			dataSource : '/api/article',
+			forceLocked : true,
 			nodeCaption : 'title',
-			nodeMouseOver : 'title',
-			forceLocked : true
+			nodeCaptionsOnByDefault : true,
+			directedEdges : true
 		});
 	</script>
 </body>
