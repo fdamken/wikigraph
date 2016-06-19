@@ -46,7 +46,6 @@
 			dataSource : '/api/article',
 			forceLocked : true,
 			nodeCaption : 'title',
-			nodeCaptionsOnByDefault : true,
 			directedEdges : true
 		});
 	</script>
